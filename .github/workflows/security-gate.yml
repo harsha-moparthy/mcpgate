@@ -1,0 +1,40 @@
+name: security-gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Lint
+        run: |
+          uv run ruff check src tests demos
+          uv run ruff format --check src tests demos
+
+      - name: Abuse suite (must report zero policy violations)
+        run: uv run pytest tests/test_abuse_suite.py -v --no-header
+
+      - name: Full test suite
+        run: uv run pytest -q --no-header
+
+      - name: OAuth 2.1 flow demo
+        run: uv run python -m demos.oauth_flow
+
+      - name: Audit reconstruction demo
+        run: uv run python -m demos.audit_reconstruction
+
+      - name: Overhead benchmark
+        run: uv run mcpgate benchmark --iterations 2000
