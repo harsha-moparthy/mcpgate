@@ -311,3 +311,100 @@ async def test_every_abuse_attempt_leaves_a_verifiable_audit_chain(
     events = runtime.audit.reconstruct("abuse-chain")
     assert [event["decision"] for event in events] == ["deny", "deny"]
     assert runtime.audit.verify_chain()
+
+
+@pytest.mark.parametrize(
+    "ticket_id",
+    ["0x1", " 1 ", [1], {"id": 1}, 1.9, True, -1, 0],
+    ids=["hex", "padded", "list", "dict", "float", "bool", "negative", "zero"],
+)
+@pytest.mark.asyncio
+async def test_type_confusion_on_integer_argument_is_refused(
+    runtime: Runtime, ticket_id: object
+) -> None:
+    """Regression: these once raised raw ValueError/TypeError past the guard.
+
+    `True` matters specifically — bool subclasses int, so `int(True) == 1`
+    silently addressed ticket 1.
+    """
+    access = runtime.provider.issue_for_client(
+        "operator-agent", "operator-local-secret"
+    ).access_token
+    with pytest.raises(GatewayError) as denied:
+        await runtime.gateway.invoke(
+            Invocation("get_ticket", {"ticket_id": ticket_id}, access, "abuse-types")
+        )
+    assert denied.value.code in {"invalid_argument_type", "missing_argument"}
+
+
+@pytest.mark.asyncio
+async def test_non_string_arguments_cannot_bypass_text_validation(
+    runtime: Runtime,
+) -> None:
+    """Regression: non-str values skipped the length and control-char checks.
+
+    A list or dict was coerced with str() during dispatch, so a NUL byte or a
+    9,000-character payload reached the store despite the declared limits.
+    """
+    access = runtime.provider.issue_for_client(
+        "operator-agent", "operator-local-secret"
+    ).access_token
+    before = len(runtime.store.list_tickets({"alpha", "beta"}))
+    for title in ({"a": 1}, ["a\x00b"], ["x" * 9_000], 12345):
+        with pytest.raises(GatewayError, match="invalid_argument_type"):
+            await runtime.gateway.invoke(
+                Invocation(
+                    "create_ticket",
+                    {"team": "alpha", "title": title, "body": "body"},
+                    access,
+                    "abuse-coercion",
+                )
+            )
+    assert len(runtime.store.list_tickets({"alpha", "beta"})) == before
+
+
+@pytest.mark.asyncio
+async def test_every_refusal_including_malformed_input_is_audited_exactly_once(
+    runtime: Runtime,
+) -> None:
+    """The audit-completeness claim, asserted rather than assumed."""
+    access = runtime.provider.issue_for_client(
+        "operator-agent", "operator-local-secret"
+    ).access_token
+    attacks = [
+        ("get_ticket", {"ticket_id": "0x1"}),
+        ("get_ticket", {"ticket_id": None}),
+        ("audit_recent", {"limit": "abc"}),
+        ("update_ticket_status", {"ticket_id": 1, "status": []}),
+        ("create_ticket", {"team": ["security"], "title": "t", "body": "b"}),
+        ("delete_everything", {}),
+    ]
+    for tool, args in attacks:
+        with pytest.raises(GatewayError):
+            await runtime.gateway.invoke(Invocation(tool, args, access, "abuse-audited"))
+    events = runtime.audit.reconstruct("abuse-audited")
+    assert len(events) == len(attacks)
+    assert all(event["decision"] == "deny" for event in events)
+    assert runtime.audit.verify_chain()
+
+
+@pytest.mark.asyncio
+async def test_internal_faults_are_audited_and_do_not_leak_details(
+    runtime: Runtime,
+) -> None:
+    """A fault below the guard must still become evidence, not a stack trace."""
+    access = runtime.provider.issue_for_client(
+        "operator-agent", "operator-local-secret"
+    ).access_token
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("connection pool exhausted: host=db-primary user=admin")
+
+    runtime.store.list_tickets = explode  # type: ignore[method-assign]
+    with pytest.raises(GatewayError) as failure:
+        await runtime.gateway.invoke(Invocation("list_tickets", {}, access, "abuse-internal"))
+    assert failure.value.code == "internal_error"
+    assert "db-primary" not in str(failure.value)
+    events = runtime.audit.reconstruct("abuse-internal")
+    assert [event["reason"] for event in events] == ["internal_error"]
+    assert runtime.audit.verify_chain()

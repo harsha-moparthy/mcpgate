@@ -15,6 +15,10 @@ from .gateway import GatewayError, Invocation
 from .runtime import Runtime, create_runtime
 
 
+class AuditedToolError(ToolError):
+    """A refusal the guard pipeline has already written to the audit trail."""
+
+
 def create_server(runtime: Runtime | None = None) -> FastMCP:
     runtime = runtime or create_runtime()
     settings = runtime.settings
@@ -46,7 +50,7 @@ def create_server(runtime: Runtime | None = None) -> FastMCP:
     async def invoke(tool: str, args: dict[str, Any], ctx: Context) -> Any:
         access = get_access_token()
         if access is None:
-            raise ToolError("invalid_token")
+            raise AuditedToolError("invalid_token")
         try:
             return await runtime.gateway.invoke(
                 Invocation(
@@ -58,7 +62,7 @@ def create_server(runtime: Runtime | None = None) -> FastMCP:
             )
         except GatewayError as exc:
             suffix = f" retry_after={exc.retry_after:.3f}" if exc.retry_after else ""
-            raise ToolError(f"{exc.code}{suffix}") from exc
+            raise AuditedToolError(f"{exc.code}{suffix}") from exc
 
     @server.tool()
     async def list_tickets(ctx: Context, status: str | None = None) -> list[dict[str, Any]]:
@@ -85,6 +89,56 @@ def create_server(runtime: Runtime | None = None) -> FastMCP:
         """Read recent structured audit events; requires audit:read."""
         return await invoke("audit_recent", {"limit": limit}, ctx)
 
+    # The SDK validates the tool name and argument schema *before* the guard
+    # pipeline runs, so a malformed or unknown-tool call would otherwise be
+    # refused with no audit record. Re-register the handler to capture those
+    # rejections too, which is what makes "every call is audited" true.
+    inner_call_tool = server.call_tool
+
+    async def audited_call_tool(name: str, arguments: dict[str, Any]) -> Any:
+        try:
+            return await inner_call_tool(name, arguments)
+        except Exception as raised:
+            # The SDK re-wraps tool exceptions, so the marker may be a cause
+            # rather than the raised type. Walk the chain to avoid
+            # double-recording a refusal the guard already logged.
+            if _already_audited(raised):
+                raise
+            access = get_access_token()
+            runtime.audit.record(
+                session_id=f"mcp-{_current_request_id(server)}",
+                client_id=access.client_id if access else None,
+                tool=name,
+                action=(
+                    runtime.policy.tools[name].action if name in runtime.policy.tools else "unknown"
+                ),
+                decision="deny",
+                reason="rejected_before_dispatch",
+                args=arguments if isinstance(arguments, dict) else {},
+                latency_ms=0.0,
+            )
+            raise
+
+    server._mcp_server.call_tool(validate_input=False)(audited_call_tool)
+
     # Keep the runtime reachable for in-process validation and operators.
     server._mcpgate_runtime = runtime  # type: ignore[attr-defined]
     return server
+
+
+def _already_audited(error: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        if isinstance(current, AuditedToolError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _current_request_id(server: FastMCP) -> str:
+    try:
+        return str(server.get_context().request_id)
+    except Exception:  # pragma: no cover - outside a request
+        return "unknown"

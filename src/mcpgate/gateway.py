@@ -62,8 +62,8 @@ class Gateway:
                 self.policy.require_tool(invocation.tool, set(access.scopes))
             except PermissionError as exc:
                 raise GatewayError("forbidden", str(exc)) from exc
-            self._validate_inputs(invocation.tool, invocation.args)
-            result = self._dispatch(invocation.tool, invocation.args, access)
+            clean = self._validate_inputs(invocation.tool, invocation.args)
+            result = self._dispatch(invocation.tool, clean, access)
         except GatewayError as exc:
             self.audit.record(
                 session_id=session_id,
@@ -76,6 +76,20 @@ class Gateway:
                 latency_ms=(time.perf_counter() - started) * 1000,
             )
             raise
+        except Exception as exc:
+            # An unexpected fault must still be evidence, and must not leak
+            # internals to the caller. Fail closed, audited.
+            self.audit.record(
+                session_id=session_id,
+                client_id=client_id,
+                tool=invocation.tool,
+                action=action_name,
+                decision="deny",
+                reason="internal_error",
+                args=invocation.args,
+                latency_ms=(time.perf_counter() - started) * 1000,
+            )
+            raise GatewayError("internal_error") from exc
         self.audit.record(
             session_id=session_id,
             client_id=client_id,
@@ -104,59 +118,91 @@ class Gateway:
             return str(access.claims.get("jti", uuid.uuid4().hex))
         return f"unauth-{uuid.uuid4().hex}"
 
-    @staticmethod
-    def _validate_inputs(tool: str, args: dict[str, Any]) -> None:
-        expected = {
-            "list_tickets": {"status"},
-            "get_ticket": {"ticket_id"},
-            "create_ticket": {"team", "title", "body"},
-            "update_ticket_status": {"ticket_id", "status"},
-            "audit_recent": {"limit"},
-        }
-        if tool not in expected:
+    # Declared argument types. Validation is positive (an allowlist of shapes),
+    # never a str() coercion, so a dict or list can never reach the store.
+    ARGUMENT_TYPES: dict[str, dict[str, str]] = {
+        "list_tickets": {"status": "optional_text"},
+        "get_ticket": {"ticket_id": "integer"},
+        "create_ticket": {"team": "text", "title": "text", "body": "text"},
+        "update_ticket_status": {"ticket_id": "integer", "status": "text"},
+        "audit_recent": {"limit": "optional_integer"},
+    }
+    VALID_STATUSES = frozenset({"open", "in_progress", "resolved", "closed", "planned"})
+    CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+    @classmethod
+    def _coerce_integer(cls, value: Any) -> int:
+        # bool is a subclass of int; True must not silently mean ticket 1.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise GatewayError("invalid_argument_type")
+        return value
+
+    @classmethod
+    def _coerce_text(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            raise GatewayError("invalid_argument_type")
+        if len(value) > 4_000:
+            raise GatewayError("input_too_long")
+        if cls.CONTROL_CHARACTERS.search(value):
+            raise GatewayError("control_character")
+        return value
+
+    @classmethod
+    def _validate_inputs(cls, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Return a type-checked copy of args, or raise a GatewayError.
+
+        Every value is validated against a declared type. Unvalidated values
+        never reach `_dispatch`, so the store cannot be handed a coerced
+        `str(dict)` or an oversized nested payload.
+        """
+        declared = cls.ARGUMENT_TYPES.get(tool)
+        if declared is None:
             raise GatewayError("unknown_tool")
-        if set(args) - expected[tool]:
+        if set(args) - set(declared):
             raise GatewayError("unexpected_argument")
-        for value in args.values():
-            if isinstance(value, str):
-                if len(value) > 4_000:
-                    raise GatewayError("input_too_long")
-                if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", value):
-                    raise GatewayError("control_character")
-        if tool == "create_ticket" and (
-            not str(args.get("title", "")).strip() or not str(args.get("body", "")).strip()
-        ):
+
+        clean: dict[str, Any] = {}
+        for name, kind in declared.items():
+            optional = kind.startswith("optional_")
+            if name not in args or args[name] is None:
+                if not optional:
+                    raise GatewayError("missing_argument")
+                clean[name] = None
+                continue
+            base = kind.removeprefix("optional_")
+            clean[name] = (
+                cls._coerce_integer(args[name])
+                if base == "integer"
+                else cls._coerce_text(args[name])
+            )
+
+        if tool == "create_ticket" and (not clean["title"].strip() or not clean["body"].strip()):
             raise GatewayError("invalid_input")
-        if tool == "update_ticket_status" and args.get("status") not in {
-            "open",
-            "in_progress",
-            "resolved",
-            "closed",
-            "planned",
-        }:
+        if tool == "update_ticket_status" and clean["status"] not in cls.VALID_STATUSES:
             raise GatewayError("invalid_status")
+        if tool == "get_ticket" and clean["ticket_id"] < 1:
+            raise GatewayError("invalid_argument_type")
+        return clean
 
     def _dispatch(self, tool: str, args: dict[str, Any], access: AccessToken) -> Any:
         claims = access.claims or {}
         teams = set(claims.get("teams", []))
         if tool == "list_tickets":
-            return self.store.list_tickets(teams, args.get("status"))
+            return self.store.list_tickets(teams, args["status"])
         if tool == "get_ticket":
-            ticket = self._visible_ticket(int(args["ticket_id"]), teams)
-            return ticket
+            return self._visible_ticket(args["ticket_id"], teams)
         if tool == "create_ticket":
-            team = str(args["team"])
-            if team not in teams:
+            if args["team"] not in teams:
                 raise GatewayError("row_scope_violation")
             return self.store.create_ticket(
-                team, str(args["title"]), str(args["body"]), access.client_id
+                args["team"], args["title"], args["body"], access.client_id
             )
         if tool == "update_ticket_status":
-            ticket_id = int(args["ticket_id"])
+            ticket_id = args["ticket_id"]
             self._visible_ticket(ticket_id, teams)
-            return self.store.update_status(ticket_id, str(args["status"]))
+            return self.store.update_status(ticket_id, args["status"])
         if tool == "audit_recent":
-            limit = min(max(int(args.get("limit", 20)), 1), 100)
+            limit = min(max(args["limit"] or 20, 1), 100)
             return self.store.audit_events(limit=limit)
         raise GatewayError("unknown_tool")
 

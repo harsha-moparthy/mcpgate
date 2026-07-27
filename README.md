@@ -21,14 +21,14 @@ So this project puts every control **in the graph, not the prompt**. Authenticat
 - Maps identities to capabilities in a **declarative YAML policy**: which scopes a client may hold, which scope each tool requires, and which teams' rows it may see. Changing an authorization decision is a config edit, not a code change.
 - Enforces **row-level filtering** on both reads and writes, and makes out-of-scope rows indistinguishable from missing ones so the boundary doesn't leak existence.
 - Applies **token-bucket rate limits per authenticated identity**, with a `retry_after` hint.
-- Writes a **structured audit event for every call, allowed or denied**, chained with HMAC-SHA256 so any later edit to the log is detectable. Sensitive fields are redacted; a digest of the full arguments is kept for forensics.
-- Ships a **12-case abuse suite** as CI, plus an overhead measurement against direct database access.
+- Writes a **structured audit event for every call, allowed or denied** — including calls the SDK rejects before the guard pipeline runs — chained with HMAC-SHA256 so any later edit to the log is detectable. Sensitive fields are redacted; a digest of the full arguments is kept for forensics.
+- Ships a **23-case abuse suite** as CI, plus an overhead measurement against direct database access.
 
 ## Success criteria (from the project spec)
 
 | # | Criterion | Evidence |
 |---|-----------|----------|
-| 1 | Abuse suite passes with zero policy violations | 12 abuse tests: forgery, replay, escalation, over-rate, injection |
+| 1 | Abuse suite passes with zero policy violations | 23 abuse tests: forgery, replay, escalation, over-rate, injection, type confusion |
 | 2 | OAuth-based auth flow, per-client tool scoping | `demos/oauth_flow.sh` — real HTTP flow, PKCE, code replay refused |
 | 3 | Rate limits per identity | Burst test: exactly `capacity` allowed, remainder throttled and audited |
 | 4 | Audit logging complete enough to reconstruct a session | `demos/audit_reconstruction.sh` — session rebuilt from log alone |
@@ -105,7 +105,7 @@ mcpgate/
 │   ├── audit_reconstruction.sh  # rebuild a session, then detect tampering
 │   └── abuse_suite.sh           # the headline: zero policy violations
 ├── tests/
-│   ├── test_abuse_suite.py      # 12 attacks, each must be refused and audited
+│   ├── test_abuse_suite.py      # 23 attacks, each must be refused and audited
 │   ├── test_auth.py             # token round-trip, replay, scope escalation
 │   ├── test_gateway.py          # scoping, row filters, rate limits
 │   ├── test_audit.py            # reconstruction, redaction, tamper detection
@@ -117,7 +117,7 @@ mcpgate/
 
 ```bash
 uv sync
-.venv/bin/pytest -q                       # 26 tests
+.venv/bin/pytest -q                       # 38 tests
 
 # the three demos (all offline, no external services)
 demos/oauth_flow.sh
@@ -141,7 +141,8 @@ Point an MCP client at `http://127.0.0.1:8000/mcp`. Clients that support OAuth d
 demos/abuse_suite.sh
 ```
 
-Twelve attacks, each of which must be refused *and* recorded:
+Every attack must be refused *and* recorded. The suite is 23 tests; the
+distinct attack classes are:
 
 | Attack | Refusal |
 |---|---|
@@ -157,6 +158,9 @@ Twelve attacks, each of which must be refused *and* recorded:
 | SQL / log4shell / prompt-injection payloads in ticket text | stored inert, nothing escalated |
 | Unknown tool, unexpected argument, invalid enum | `unknown_tool` / `unexpected_argument` / `invalid_status` |
 | 12-call burst against a capacity-5 bucket | 5 allowed, 7 `rate_limited` with `retry_after` |
+| Type confusion on an integer arg (`"0x1"`, `[1]`, `1.9`, `True`, `-1`) | `invalid_argument_type`, audited |
+| Dict/list/oversized values evading text validation | `invalid_argument_type`, nothing written |
+| An internal fault below the guard | `internal_error`, audited, no details leaked |
 
 ### 2. OAuth 2.1 end to end
 
@@ -216,21 +220,65 @@ Produced by scripts in this repository on 2026-07-27 (Apple M4 Pro, Python 3.12)
 
 | Evidence | Result |
 |---|---|
-| Full test suite | **26/26 passed** |
-| Abuse suite | **12/12 refused, zero policy violations** |
+| Full test suite | **38/38 passed** |
+| Abuse suite | **23/23 refused, zero policy violations** |
 | OAuth 2.1 flow demo (discovery → PKCE → token → MCP call) | **PASSED**, incl. code replay and verifier mismatch refused |
 | Audit reconstruction demo | **PASSED** — session rebuilt, tampering detected |
-| Governed call latency, median | **0.072 ms** (direct 0.008 ms) |
-| Governed call latency, p95 | **0.094 ms** (direct 0.010 ms) |
-| Security overhead, median / p95 | **+0.065 ms / +0.084 ms** (5,000 iterations) |
+| Audit completeness over HTTP | **exactly 1 event per call** across allow, guard denial, schema rejection, unknown tool |
+| Governed call latency, median | **0.080 ms** (direct 0.009 ms) |
+| Governed call latency, p95 | **0.106 ms** (direct 0.012 ms) |
+| Security overhead, median / p95 | **+0.071 ms / +0.094 ms** (5,000 iterations) |
 
 ### Reading the overhead number honestly
 
-The full guard pipeline — JWT verification, rate-limit accounting, scope lookup, argument validation, row filtering, and an HMAC-chained audit write — costs about **65 microseconds** at the median. That is roughly 8× the cost of the bare SQLite read it protects, which sounds alarming and isn't: the baseline is an in-process query on three rows, close to the cheapest operation a server can perform.
+The full guard pipeline — JWT verification, rate-limit accounting, scope lookup, argument validation, row filtering, and an HMAC-chained audit write — costs about **71 microseconds** at the median. That is roughly 8× the cost of the bare SQLite read it protects, which sounds alarming and isn't: the baseline is an in-process query on three rows, close to the cheapest operation a server can perform.
 
-The honest framing is absolute, not relative. Against a real wrapped system, where a single database round trip or upstream API call runs from a few milliseconds to a few hundred, 65 µs is between 0.01% and 2% of request time. And the audit write — the part that is a durable disk operation — dominates that budget, which is the right place for the cost to sit.
+The honest framing is absolute, not relative. Against a real wrapped system, where a single database round trip or upstream API call runs from a few milliseconds to a few hundred, 71 µs is between 0.01% and 2% of request time. And the audit write — the part that is a durable disk operation — dominates that budget, which is the right place for the cost to sit.
 
 What this measurement does **not** cover: HTTP transport, TLS, JSON-RPC framing, or network latency, all of which the SDK handles and all of which are orders of magnitude larger. This number isolates the policy layer specifically, because that is the part this project is responsible for.
+
+## What a second audit pass found
+
+The suite passing only proves the tests agree with the code. A follow-up
+adversarial pass — probing inputs no test covered — found three real defects in
+a server whose whole point is that it can be trusted. All three are fixed, with
+regression tests; they are recorded here because the failure modes are more
+instructive than the fixes.
+
+**1. Malformed input escaped the guard entirely, unaudited.** `get_ticket` did
+`int(args["ticket_id"])` inside dispatch. A value like `"0x1"` or `None` raised
+a raw `ValueError`/`TypeError` that flew past the `except GatewayError` handler,
+so the call produced **no audit record at all** — the one outcome the design
+explicitly promises can't happen. Now every value is checked against a declared
+type before dispatch, and a catch-all records an `internal_error` denial so a
+fault below the guard is still evidence rather than a silence.
+
+**2. Non-string arguments bypassed input validation.** The validation loop was
+guarded by `isinstance(value, str)`, and dispatch coerced with `str(...)`. So
+`title=["a\x00b"]` and a 9,000-character nested list both sailed through the
+control-character and length limits and were written to the store. Validation is
+now a positive allowlist of shapes: a dict or list is refused outright, never
+stringified.
+
+**3. `ticket_id=True` addressed ticket 1.** `bool` subclasses `int` in Python,
+so `int(True) == 1`. Low severity on its own, and exactly the kind of type
+confusion that becomes a real bug once an ID is used for an authorization
+decision. Booleans are now rejected where an integer is required.
+
+**4. The audit-completeness claim was false.** The most useful finding, because
+it was a documentation defect rather than a code one. The MCP SDK validates the
+tool name and argument schema *before* the guard pipeline runs, so a malformed
+or unknown-tool call — precisely what an attacker probing the surface generates
+— was refused with zero audit rows. The README nonetheless claimed an event for
+every call. The tool handler is now wrapped so SDK-level rejections are recorded
+too, and a test asserts **exactly one** event per call across all four paths
+(allowed, guard-denied, schema-rejected, unknown tool), which also pins down the
+double-counting bug the first version of that fix introduced.
+
+The lesson generalizes past this repo: the controls I had written tests for
+worked, and the gaps were all in the seams — between the SDK's validation layer
+and mine, and between Python's type coercion and my assumptions. Seams are where
+to look.
 
 ## Known limits
 
@@ -238,6 +286,11 @@ What this measurement does **not** cover: HTTP transport, TLS, JSON-RPC framing,
 - **In-memory rate limiter.** Per-process buckets. Multi-instance deployments need a shared store (Redis) or the effective limit multiplies by instance count.
 - **Clients are statically provisioned.** Dynamic client registration is deliberately disabled; identities come from `policy.yaml`.
 - **Tool-level scopes, not effect-level.** A capability reachable through two different tools needs both gated correctly. Project 1.01 hit exactly this failure mode live — an agent achieved a gated outcome through an ungated tool — which is why row filters here are enforced in the dispatch path for *every* mutating tool rather than per tool name.
+- **`audit_recent` is not team-filtered.** Any client holding `audit:read` sees
+  events across all teams, including ticket IDs and titles in the recorded
+  arguments. Not exploitable under the committed policy (the only `audit:read`
+  holder already has every team), but it is a latent row-scope gap: audit events
+  are not team-tagged, so the filter has nowhere to attach yet.
 - **SQLite.** Chosen so the security properties are the interesting part. The guard pipeline is storage-agnostic.
 
 ## Honesty note
