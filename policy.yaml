@@ -1,0 +1,30 @@
+version: 1
+clients:
+  readonly-agent:
+    secret: readonly-local-secret
+    scopes: [tickets:read]
+    teams: [alpha]
+  operator-agent:
+    secret: operator-local-secret
+    scopes: [tickets:read, tickets:write]
+    teams: [alpha, beta]
+  auditor-agent:
+    secret: auditor-local-secret
+    scopes: [tickets:read, audit:read]
+    teams: [alpha, beta, security]
+tools:
+  list_tickets:
+    scope: tickets:read
+    action: read
+  get_ticket:
+    scope: tickets:read
+    action: read
+  create_ticket:
+    scope: tickets:write
+    action: write
+  update_ticket_status:
+    scope: tickets:write
+    action: write
+  audit_recent:
+    scope: audit:read
+    action: read
