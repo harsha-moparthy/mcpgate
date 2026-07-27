@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
     action TEXT NOT NULL,
     decision TEXT NOT NULL,
     reason TEXT NOT NULL,
+    subject_team TEXT,
     args_json TEXT NOT NULL,
     args_digest TEXT NOT NULL,
     latency_ms REAL NOT NULL,
@@ -222,16 +223,38 @@ class Store:
             ).fetchone()
             return str(row[0]) if row else "0" * 64
 
-    def audit_events(self, session_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        with self._lock:
-            if session_id:
-                rows = self.connection.execute(
-                    "SELECT * FROM audit_events WHERE session_id=? ORDER BY sequence LIMIT ?",
-                    (session_id, limit),
-                )
+    def audit_events(
+        self,
+        session_id: str | None = None,
+        limit: int = 100,
+        teams: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read audit events, optionally restricted to a caller's team scope.
+
+        `teams=None` means unrestricted, and is only for internal use: chain
+        verification and the operator CLI. Reads arriving through a tool always
+        pass an explicit scope, so an event describing another team's data is
+        not returned even though the row exists.
+        """
+        clauses: list[str] = []
+        values: list[Any] = []
+        if session_id:
+            clauses.append("session_id = ?")
+            values.append(session_id)
+        if teams is not None:
+            # A null subject_team means the event has no data subject (auth
+            # failures, or listings that were themselves row-filtered), so it
+            # carries no other team's content.
+            if teams:
+                placeholders = ",".join("?" for _ in teams)
+                clauses.append(f"(subject_team IS NULL OR subject_team IN ({placeholders}))")
+                values.extend(sorted(teams))
             else:
-                rows = self.connection.execute(
-                    "SELECT * FROM audit_events ORDER BY sequence DESC LIMIT ?",
-                    (limit,),
-                )
+                clauses.append("subject_team IS NULL")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        order = "ORDER BY sequence" if session_id else "ORDER BY sequence DESC"
+        with self._lock:
+            rows = self.connection.execute(
+                f"SELECT * FROM audit_events{where} {order} LIMIT ?", (*values, limit)
+            )
             return [dict(row) for row in rows]

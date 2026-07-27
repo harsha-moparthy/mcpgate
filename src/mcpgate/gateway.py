@@ -52,6 +52,7 @@ class Gateway:
         session_id = invocation.session_id or self._session_id(access)
         action = self.policy.tools.get(invocation.tool)
         action_name = action.action if action else "unknown"
+        subject_team = self._subject_team(invocation.tool, invocation.args)
         try:
             if access is None:
                 raise GatewayError("invalid_token")
@@ -74,6 +75,7 @@ class Gateway:
                 reason=exc.code,
                 args=invocation.args,
                 latency_ms=(time.perf_counter() - started) * 1000,
+                subject_team=subject_team,
             )
             raise
         except Exception as exc:
@@ -88,6 +90,7 @@ class Gateway:
                 reason="internal_error",
                 args=invocation.args,
                 latency_ms=(time.perf_counter() - started) * 1000,
+                subject_team=subject_team,
             )
             raise GatewayError("internal_error") from exc
         self.audit.record(
@@ -99,6 +102,7 @@ class Gateway:
             reason="policy_satisfied",
             args=invocation.args,
             latency_ms=(time.perf_counter() - started) * 1000,
+            subject_team=subject_team,
         )
         return result
 
@@ -111,6 +115,28 @@ class Gateway:
             claims={"teams": sorted(teams)},
         )
         return self._dispatch(tool, args, access)
+
+    def _subject_team(self, tool: str, args: dict[str, Any]) -> str | None:
+        """Which team's data this call concerns, for audit row-scoping.
+
+        Best-effort and untrusted-input safe: it runs before validation, so it
+        must tolerate any argument shape. `None` means the event has no single
+        data subject (an auth failure, or a listing that was itself
+        row-filtered), and such events are readable by any auditor.
+        """
+        try:
+            if tool == "create_ticket":
+                team = args.get("team")
+                return team if isinstance(team, str) else None
+            if tool in {"get_ticket", "update_ticket_status"}:
+                ticket_id = args.get("ticket_id")
+                if isinstance(ticket_id, bool) or not isinstance(ticket_id, int):
+                    return None
+                ticket = self.store.get_ticket(ticket_id)
+                return ticket["team"] if ticket else None
+        except Exception:  # pragma: no cover - tagging must never break a call
+            return None
+        return None
 
     @staticmethod
     def _session_id(access: AccessToken | None) -> str:
@@ -203,7 +229,9 @@ class Gateway:
             return self.store.update_status(ticket_id, args["status"])
         if tool == "audit_recent":
             limit = min(max(args["limit"] or 20, 1), 100)
-            return self.store.audit_events(limit=limit)
+            # Audit reads are row-scoped like any other read: an auditor sees
+            # events about its own teams' data, never another team's.
+            return self.store.audit_events(limit=limit, teams=teams)
         raise GatewayError("unknown_tool")
 
     def _visible_ticket(self, ticket_id: int, teams: set[str]) -> dict[str, Any]:

@@ -36,6 +36,7 @@ class AuditLog:
         reason: str,
         args: dict[str, Any],
         latency_ms: float,
+        subject_team: str | None = None,
     ) -> dict[str, Any]:
         safe = _safe_args(args)
         args_json = json.dumps(safe, sort_keys=True, separators=(",", ":"))
@@ -53,6 +54,7 @@ class AuditLog:
                 "action": action,
                 "decision": decision,
                 "reason": reason,
+                "subject_team": subject_team,
                 "args_json": args_json,
                 "args_digest": args_digest,
                 "latency_ms": round(latency_ms, 6),
@@ -71,6 +73,7 @@ class AuditLog:
                 "action": action,
                 "decision": decision,
                 "reason": reason,
+                "subject_team": subject_team,
                 "args_json": args_json,
                 "args_digest": args_digest,
                 "latency_ms": round(latency_ms, 6),
@@ -96,6 +99,7 @@ class AuditLog:
                         "action",
                         "decision",
                         "reason",
+                        "subject_team",
                         "args_json",
                         "args_digest",
                         "latency_ms",

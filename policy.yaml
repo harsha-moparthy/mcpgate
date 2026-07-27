@@ -12,6 +12,12 @@ clients:
     secret: auditor-local-secret
     scopes: [tickets:read, audit:read]
     teams: [alpha, beta, security]
+  # A deliberately narrow auditor: holds audit:read but only one team, so it
+  # proves audit reads are row-scoped rather than global.
+  alpha-auditor-agent:
+    secret: alpha-auditor-local-secret
+    scopes: [tickets:read, audit:read]
+    teams: [alpha]
 tools:
   list_tickets:
     scope: tickets:read

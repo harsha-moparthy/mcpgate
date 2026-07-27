@@ -7,6 +7,7 @@ audit record. A denial that is not auditable is not a control.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import replace
 
@@ -407,4 +408,72 @@ async def test_internal_faults_are_audited_and_do_not_leak_details(
     assert "db-primary" not in str(failure.value)
     events = runtime.audit.reconstruct("abuse-internal")
     assert [event["reason"] for event in events] == ["internal_error"]
+    assert runtime.audit.verify_chain()
+
+
+@pytest.mark.asyncio
+async def test_audit_reads_are_row_scoped_like_any_other_read(runtime: Runtime) -> None:
+    """Regression: `audit_recent` used to return every team's events.
+
+    A client holding audit:read saw ticket titles and IDs belonging to teams it
+    had no access to — a row-scope hole that happened to be unreachable only
+    because the sole audit:read holder already had every team.
+    """
+    operator = runtime.provider.issue_for_client(
+        "operator-agent", "operator-local-secret"
+    ).access_token
+    broad = runtime.provider.issue_for_client("auditor-agent", "auditor-local-secret").access_token
+    narrow = runtime.provider.issue_for_client(
+        "alpha-auditor-agent", "alpha-auditor-local-secret"
+    ).access_token
+
+    await runtime.gateway.invoke(
+        Invocation(
+            "create_ticket",
+            {"team": "alpha", "title": "ALPHA-VISIBLE", "body": "b"},
+            operator,
+            "scoped",
+        )
+    )
+    await runtime.gateway.invoke(
+        Invocation(
+            "create_ticket",
+            {"team": "beta", "title": "BETA-CONFIDENTIAL", "body": "b"},
+            operator,
+            "scoped",
+        )
+    )
+
+    broad_events = await runtime.gateway.invoke(
+        Invocation("audit_recent", {"limit": 50}, broad, "scoped")
+    )
+    narrow_events = await runtime.gateway.invoke(
+        Invocation("audit_recent", {"limit": 50}, narrow, "scoped")
+    )
+
+    assert {event["subject_team"] for event in broad_events} >= {"alpha", "beta"}
+    assert {event["subject_team"] for event in narrow_events} <= {"alpha", None}
+    serialized = json.dumps(narrow_events)
+    assert "BETA-CONFIDENTIAL" not in serialized
+    assert "Rotate signing key" not in serialized
+    assert runtime.audit.verify_chain()
+
+
+@pytest.mark.asyncio
+async def test_subject_team_tagging_survives_malformed_arguments(
+    runtime: Runtime,
+) -> None:
+    """Tagging runs before validation, so it must tolerate any argument shape."""
+    access = runtime.provider.issue_for_client(
+        "operator-agent", "operator-local-secret"
+    ).access_token
+    for tool, args in (
+        ("get_ticket", {"ticket_id": "0x1"}),
+        ("get_ticket", {"ticket_id": [1]}),
+        ("create_ticket", {"team": ["alpha"], "title": "t", "body": "b"}),
+        ("update_ticket_status", {"ticket_id": None, "status": "open"}),
+    ):
+        with pytest.raises(GatewayError):
+            await runtime.gateway.invoke(Invocation(tool, args, access, "tagging"))
+    assert len(runtime.audit.reconstruct("tagging")) == 4
     assert runtime.audit.verify_chain()
